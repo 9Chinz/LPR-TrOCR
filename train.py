@@ -1,15 +1,18 @@
 # config
-root_dataset_dir = "dataset_1/"
-output_dir = "./output_model/out-str-2"
+root_dataset_dir = "dataset_2/"
+output_dir = "./output_model/out-str-test-2"
 #custom_model_name = "microsoft/trocr-base-printed"
 custom_model_name = "microsoft/trocr-base-str"
 epochs = 100 # 10
 learning_rate = 5e-5 # 5e-5
-batch_size = 32 # 4
+batch_size = 16 # 4
+n_workers = 32
+eval_round = 25
 # end config
 
 import torch
 import os
+from accelerate import Accelerator
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
@@ -41,7 +44,7 @@ print(len(df_dataset1))
 
 from sklearn.model_selection import train_test_split
 
-train_df, test_df = train_test_split(df_dataset1, test_size=0.2)
+train_df, test_df = train_test_split(df_dataset1, test_size=0.05)
 # we reset the indices to start from zero
 train_df.reset_index(drop=True, inplace=True)
 test_df.reset_index(drop=True, inplace=True)
@@ -100,19 +103,22 @@ for k,v in encoding.items():
     
 from torch.utils.data import DataLoader
 
-train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-eval_dataloader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=False)
+train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=n_workers)
+eval_dataloader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=n_workers)
 
 print(f"{'='*20} End prepare dataset {'='*20}")
 print(f"{'='*20} Start training {'='*20}")
 
 from transformers import VisionEncoderDecoderModel
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# add accelerator
+accelerator = Accelerator(gradient_accumulation_steps=4)
+device = accelerator.device
 print(f'{"="*20} Using device: {device} {"="*20}')
 
 model = VisionEncoderDecoderModel.from_pretrained(custom_model_name)
-model.to(   )
+model.to(device)
 
 # set special tokens used for creating the decoder_input_ids from the labels
 model.config.decoder_start_token_id = processor.tokenizer.cls_token_id
@@ -127,10 +133,11 @@ model.config.early_stopping = True
 model.config.no_repeat_ngram_size = 3
 model.config.length_penalty = 2.0
 model.config.num_beams = 4
+model.config.use_cache = True
 
-from datasets import load_metric
+import evaluate
 
-cer_metric = load_metric("cer")
+cer_metric = evaluate.load("cer")
 
 def compute_cer(pred_ids, label_ids):
     pred_str = processor.batch_decode(pred_ids, skip_special_tokens=True)
@@ -143,20 +150,23 @@ def compute_cer(pred_ids, label_ids):
 
 print("In training loop... ")
 
-res_df = pd.DataFrame(columns=['epoch', 'train_loss', 'valid_cer'])
+res_df = pd.DataFrame(columns=['epoch', 'train_loss'])
 
-from transformers import AdamW
 from tqdm import tqdm
 
 import time
 
 t1 = time.time()
-optimizer = AdamW(model.parameters(), lr=learning_rate)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+least_cer = 1.0
+best_epoch = 0
 
 # save model
 os.makedirs(output_dir, exist_ok=True)
-least_cer = 1.0
-best_epoch = 0
+
+# accelerate prepare
+model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(model, optimizer, train_dataloader, eval_dataloader)
 
 for epoch in range(epochs):  # loop over the dataset multiple times
     # train
@@ -164,44 +174,48 @@ for epoch in range(epochs):  # loop over the dataset multiple times
     model.train()
     train_loss = 0.0
     for batch in tqdm(train_dataloader):
-        # get the inputs
-        for k,v in batch.items():
-            batch[k] = v.to(device)
+        with accelerator.accumulate(model):
+            # get the inputs
+            for k,v in batch.items():
+                batch[k] = v.to(device)
 
-        # forward + backward + optimize
-        outputs = model(**batch)
-        loss = outputs.loss
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
+            # forward + backward + optimize
+            outputs = model(**batch)
+            loss = outputs.loss
+            # using accelerate
+            accelerator.backward(loss)
+            #loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
 
-        train_loss += loss.item()
+            train_loss += loss.item()
 
     print(f"Epoch {epoch} took {time.time() - t1_train} seconds")
     print(f"Loss after epoch {epoch}:", train_loss/len(train_dataloader))
     
     # evaluate
-    eval_t1 = time.time()
-    model.eval()
-    valid_cer = 0.0
-    with torch.no_grad():
-        for batch in tqdm(eval_dataloader):
-            # run batch generation
-            outputs = model.generate(batch["pixel_values"].to(device))
-            # compute metrics
-            cer = compute_cer(pred_ids=outputs, label_ids=batch["labels"])
-            valid_cer += cer 
-    print(f"Evaluation took {time.time() - eval_t1} seconds")
-    print("Validation CER:", valid_cer / len(eval_dataloader))
+    if ((epoch+1) % eval_round == 0):
+        eval_t1 = time.time()
+        model.eval()
+        valid_cer = 0.0
+        with torch.no_grad():
+            for batch in tqdm(eval_dataloader):
+                # run batch generation
+                outputs = model.generate(batch["pixel_values"].to(device),)
+                # compute metrics
+                cer = compute_cer(pred_ids=outputs, label_ids=batch["labels"])
+                valid_cer += cer 
+        print(f"Evaluation took {time.time() - eval_t1} seconds")
+        print("Validation CER:", valid_cer / len(eval_dataloader))
     
-    # save model if it has the best cer
-    if valid_cer / len(eval_dataloader) < least_cer:
-        print(f"{'!'*20} Saving model with lowest CER {'!'*20}")
-        best_epoch = epoch
-        least_cer = valid_cer / len(eval_dataloader)
-        model.save_pretrained(output_dir)
-    
-    res_df.loc[epoch] = {'epoch': epoch+1, 'train_loss': train_loss/len(train_dataloader), 'valid_cer': valid_cer / len(eval_dataloader)}
+        # save model if it has the best cer
+        if valid_cer / len(eval_dataloader) < least_cer:
+            print(f"{'!'*20} Saving model with lowest CER {'!'*20}")
+            best_epoch = epoch
+            least_cer = valid_cer / len(eval_dataloader)
+            model.save_pretrained(output_dir)
+        
+    res_df.loc[epoch] = {'epoch': epoch+1, 'train_loss': train_loss/len(train_dataloader)}
 
 print(f"{'='*20} Finished Training {'='*20}")
 
@@ -209,8 +223,6 @@ print(f"{'='*20} Finished Training {'='*20}")
 sub_dir = f"{output_dir}/checkpoint-{epochs}"
 os.makedirs(sub_dir, exist_ok=True)
 model.save_pretrained(sub_dir)
-
-# show total time and loss
 
 print(f"{'='*20} total time trained {'='*20}")
 from datetime import timedelta
@@ -222,10 +234,10 @@ def get_time_hh_mm_ss(sec):
 
     # split string into individual component
     x = td_str.split(':')
-    print('Time in hh:mm:ss:', x[0], 'Hours', x[1], 'Minutes', x[2], 'Seconds')
+    return f'Time in hh:mm:ss: {x[0]} Hours {x[1]} Minutes {x[2]} Seconds'
 
+print(get_time_hh_mm_ss(time.time() - t1))
 
-get_time_hh_mm_ss(time.time() - t1)
 print(f"{'='*20} train loss {'='*20}")
 
 from tabulate import tabulate

@@ -3,3 +3,11 @@
 /dataset/*
 
 /output_model/*
+
+get-gpu.sh
+
+work-time.txt
+
+err_*.txt
+
+out_*.txt
