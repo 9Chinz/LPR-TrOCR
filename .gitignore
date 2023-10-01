@@ -11,3 +11,5 @@ work-time.txt
 err_*.txt
 
 out_*.txt
+
+run-jupyter.sh

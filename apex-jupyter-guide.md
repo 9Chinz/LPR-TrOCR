@@ -5,8 +5,8 @@
 - prism-N is the name of the machine that jupyter get gpu
 - use command ```squeue -u $USER``` to check if the job is running
 
-## 📝 edit your run-jupyter.sh
-can edit job name in run-jupyter.sh at part 
+## 📝 edit your example-run-jupyter.sh
+can edit job name in example-run-jupyter.sh at part 
 - ```#SBATCH -A <your name>```  change to your project name
 - ```#SBATCH --gres=gpu:<N>``` can change to gpu:N if you want more gpu
 - ```#SBATCH --job-name=<your job name>``` change to your job name 
@@ -14,7 +14,7 @@ can edit job name in run-jupyter.sh at part
 
 ## 🅰️ on apex
 
-- run ```sbatch run-jupyter.sh```
+- run ```sbatch example-run-jupyter.sh```
 - look for token in file err_%j.txt
     - token look something like this ```http://prism-1:6789/lab?token=732bc7b09482ac...```
     - copy only token part ```732bc7b09482ac...```
