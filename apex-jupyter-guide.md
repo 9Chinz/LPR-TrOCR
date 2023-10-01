@@ -4,6 +4,11 @@
 - dip_M is the username that login
 - prism-N is the name of the machine that jupyter get gpu
 - use command ```squeue -u $USER``` to check if the job is running
+- please prepare your conda environment before run jupyter
+    - if you don't have conda environment please create conda from environment.yml like this
+    ```sh
+    conda env create -f environment.yml
+    ```
 
 ## 📝 edit your example-run-jupyter.sh
 can edit job name in example-run-jupyter.sh at part 
